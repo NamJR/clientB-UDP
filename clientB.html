@@ -106,7 +106,9 @@
   </div>
 
   <script>
-    const SERVER_URL = `http://${window.location.hostname}:5221/api/Signal`;
+    const SERVER_IP = localStorage.getItem('serverIP') || prompt("📡 Nhập IP hoặc hostname của server (ví dụ: 192.168.1.100):", "localhost");
+    if (SERVER_IP) localStorage.setItem('serverIP', SERVER_IP);
+    const SERVER_URL = `http://${SERVER_IP}:5221/api/Signal`;
     let localConnection;
     let connectionId = null;
     let localStream;
