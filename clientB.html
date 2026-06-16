@@ -107,28 +107,16 @@
   </div>
 
   <script>
-    // Lấy cấu hình Server từ localStorage (giống Client A)
-    let SERVER_IP = localStorage.getItem('SERVER_IPv4') || null;
-    let SERVER_PORT = localStorage.getItem('SERVER_PORT') || '5221';
-    let SERVER_URL = null;
-    
-    function buildServerURL() {
-      if (!SERVER_IP) {
-        SERVER_IP = prompt("📡 Nhập IPv4 Address của Server (ví dụ: 192.168.1.14):", "localhost");
-        if (!SERVER_IP) {
-          alert("❌ Cần nhập IPv4 Address!");
-          throw new Error("IPv4 Address không được cấu hình");
-        }
-        localStorage.setItem('SERVER_IPv4', SERVER_IP);
-      }
-      
-      SERVER_PORT = localStorage.getItem('SERVER_PORT') || '5221';
-      SERVER_URL = `http://${SERVER_IP}:${SERVER_PORT}/api/Signal`;
-      console.log("🔗 Server URL:", SERVER_URL);
-      return SERVER_URL;
+    // Mỗi lần load trang luôn phải nhập lại IP và Port (không nhớ)
+    let SERVER_IP = prompt("📡 Nhập IPv4 Address của Server (ví dụ: 192.168.1.14):", "localhost");
+    if (!SERVER_IP) {
+      alert("❌ Cần nhập IPv4 Address!");
+      throw new Error("IPv4 Address không được cấu hình");
     }
     
-    buildServerURL();
+    let SERVER_PORT = prompt("Nhập Port Server (mặc định 5221):", "5221") || "5221";
+    const SERVER_URL = `http://${SERVER_IP}:${SERVER_PORT}/api/Signal`;
+    console.log("🔗 Server URL:", SERVER_URL);
     
     let localConnection;
     let connectionId = null;
