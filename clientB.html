@@ -124,29 +124,42 @@
     }
 
     async function receiveCall() {
-      connectionId = prompt("📞 Enter Connection ID to receive the call:");
-      if (!connectionId) return;
+      connectionId = prompt("📞 Nhập Connection ID để nhận cuộc gọi từ Client A:");
+      if (!connectionId) {
+        console.log("❌ Connection ID không được cung cấp");
+        return;
+      }
 
       document.getElementById('connectionIdDisplay').textContent = connectionId;
       document.getElementById('connectionInfo').style.display = "inline-block";
 
-      console.log("📥 Receiving Offer...");
+      console.log("📥 Đang chờ nhận Offer từ Client A...");
+      console.log("🔗 Server URL:", SERVER_URL);
+      
       try {
         const response = await fetch(`${SERVER_URL}/offer/${connectionId}`);
-        if (!response.ok) throw new Error(`❌ Failed to get Offer. HTTP Status: ${response.status}`);
+        if (!response.ok) {
+          throw new Error(`❌ Không lấy được Offer. HTTP Status: ${response.status}`);
+        }
 
         const offer = await response.json();
-        console.log("✅ Offer received:", offer);
+        console.log("✅ Offer nhận được:", offer);
         await handleOffer(offer);
       } catch (error) {
-        console.error("🚨 Error receiving call:", error);
+        console.error("🚨 Lỗi khi nhận cuộc gọi:", error);
+        alert("❌ Lỗi: " + error.message);
       }
     }
 
     async function handleOffer(offer) {
+      // Lấy local stream TRƯỚC khi tạo PeerConnection
+      localStream = await getLocalVideoStream();
+
       localConnection = new RTCPeerConnection({
         iceServers: [
           { urls: "stun:stun.l.google.com:19302" },
+          { urls: "stun:stun1.l.google.com:19302" },
+          { urls: "stun:stun2.l.google.com:19302" },
           {
             urls: 'turn:turn.anyfirewall.com:443?transport=tcp',
             credential: 'webrtc',
@@ -155,34 +168,56 @@
         ]
       });
 
+      // Thêm local tracks TRƯỚC khi set remote description
+      localStream.getTracks().forEach(track => localConnection.addTrack(track, localStream));
+
       localConnection.onicecandidate = event => {
-        if (event.candidate) sendIceCandidate(event.candidate);
+        if (event.candidate) {
+          console.log("🧊 ICE Candidate từ Client B:", event.candidate);
+          sendIceCandidate(event.candidate);
+        }
       };
 
       localConnection.oniceconnectionstatechange = () => {
-        console.log("ICE Connection State:", localConnection.iceConnectionState);
+        console.log("🔌 ICE Connection State:", localConnection.iceConnectionState);
+        if (localConnection.iceConnectionState === "connected" || localConnection.iceConnectionState === "completed") {
+          console.log("✅ ICE Connection thành công!");
+        }
       };
 
       localConnection.ontrack = event => {
-        console.log("📡 Received track from Client A:", event.streams[0]);
+        console.log("📡 Received track từ Client A:", event.streams[0]);
         document.getElementById('remoteVideo').srcObject = event.streams[0];
       };
 
-      localStream = await getLocalVideoStream();
-      localStream.getTracks().forEach(track => localConnection.addTrack(track, localStream));
+      try {
+        // Set remote description từ Offer
+        await localConnection.setRemoteDescription(new RTCSessionDescription(offer));
+        console.log("✅ Remote Description đã được set");
 
-      await localConnection.setRemoteDescription(new RTCSessionDescription(offer));
-      const answer = await localConnection.createAnswer();
-      await localConnection.setLocalDescription(answer);
+        // Tạo Answer
+        const answer = await localConnection.createAnswer();
+        await localConnection.setLocalDescription(answer);
+        console.log("✅ Local Description (Answer) đã được set");
 
-      await fetch(`${SERVER_URL}/answer/${connectionId}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(answer),
-      });
+        // Gửi Answer lên server
+        const response = await fetch(`${SERVER_URL}/answer/${connectionId}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(answer),
+        });
 
-      console.log("✅ Answer sent to server!");
-      fetchIceCandidates();
+        if (!response.ok) {
+          throw new Error(`❌ Server rejected answer. Status: ${response.status}`);
+        }
+
+        console.log("✅ Answer sent to server!");
+        
+        // Bắt đầu lấy ICE Candidates từ server
+        fetchIceCandidates();
+      } catch (error) {
+        console.error("🚨 Error handling offer:", error);
+      }
     }
 
     async function sendIceCandidate(candidate) {
@@ -198,23 +233,47 @@
       }
     }
 
+    let iceFetchInterval = null;
+    let processedCandidates = new Set();
+
     async function fetchIceCandidates() {
-      setInterval(async () => {
-        if (!connectionId || !localConnection.remoteDescription) return;
+      if (iceFetchInterval) clearInterval(iceFetchInterval);
+      
+      iceFetchInterval = setInterval(async () => {
+        if (!connectionId || !localConnection || !localConnection.remoteDescription) {
+          console.log("⏳ Chờ remote description...");
+          return;
+        }
+
         try {
           const response = await fetch(`${SERVER_URL}/candidate/${connectionId}`);
           if (response.ok) {
             const candidates = await response.json();
-            candidates.forEach(candidate => {
-              localConnection.addIceCandidate(new RTCIceCandidate(candidate))
-                .then(() => console.log("✅ ICE Candidate added:", candidate))
-                .catch(err => console.error("🚨 Error adding ICE Candidate:", err));
-            });
+            
+            for (let candidate of candidates) {
+              const candidateStr = JSON.stringify(candidate);
+              
+              // Tránh add candidate trùng lặp
+              if (processedCandidates.has(candidateStr)) {
+                continue;
+              }
+              
+              processedCandidates.add(candidateStr);
+              
+              try {
+                await localConnection.addIceCandidate(new RTCIceCandidate(candidate));
+                console.log("✅ ICE Candidate added:", candidate.candidate);
+              } catch (err) {
+                if (err.name !== 'InvalidStateError') {
+                  console.error("🚨 Error adding ICE Candidate:", err);
+                }
+              }
+            }
           }
         } catch (error) {
-          console.error("🚨 Error fetching ICE Candidate:", error);
+          console.error("🚨 Error fetching ICE Candidates:", error);
         }
-      }, 1000);
+      }, 500); // Giảm interval từ 1000ms xuống 500ms để nhanh hơn
     }
 
     document.getElementById('receiveCallButton').addEventListener('click', receiveCall);
