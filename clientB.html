@@ -229,9 +229,19 @@
           if (localConnection.iceConnectionState === "connected") {
             connectionStatus = "connected";
             console.log("✅ ICE Connection thành công!");
+          } else if (localConnection.iceConnectionState === "completed") {
+            connectionStatus = "connected";
+            console.log("✅ ICE Connection completed!");
           } else if (localConnection.iceConnectionState === "failed") {
             connectionStatus = "disconnected";
-            console.error("❌ ICE Connection thất bại!");
+            console.error("❌ ICE Connection thất bại! Kiểm tra firewall/NAT/TURN server");
+            // Thử reconnect
+            setTimeout(() => {
+              if (connectionStatus === "disconnected") {
+                console.log("🔄 Attempting reconnection...");
+                receiveCall();
+              }
+            }, 3000);
           } else if (localConnection.iceConnectionState === "disconnected") {
             connectionStatus = "disconnected";
             console.error("❌ ICE Connection bị ngắt!");
@@ -244,8 +254,18 @@
 
         localConnection.ontrack = event => {
           console.log("📹 Received track từ Client A:", event.track.kind);
-          document.getElementById('remoteVideo').srcObject = event.streams[0];
+          if (event.streams && event.streams.length > 0) {
+            document.getElementById('remoteVideo').srcObject = event.streams[0];
+            console.log("✅ Remote video stream set successfully");
+          }
         };
+
+        localConnection.addEventListener('track', (event) => {
+          console.log("📹 Track event:", event.track.kind, "- enabled:", event.track.enabled);
+          if (event.track.kind === 'video') {
+            console.log("✅ Video track received! Stream count:", event.streams.length);
+          }
+        });
 
         // Set remote description từ Offer
         console.log("📋 Setting remote description...");
@@ -331,6 +351,12 @@
               consecutiveEmpty = 0; // Reset counter nếu có candidate
               
               for (let candidate of candidates) {
+                // Kiểm tra candidate hợp lệ
+                if (!candidate || !candidate.candidate || candidate.candidate.length === 0) {
+                  console.warn("⚠️ Invalid candidate (empty):", candidate);
+                  continue;
+                }
+                
                 const candidateStr = JSON.stringify(candidate);
                 
                 // Tránh add candidate trùng lặp
@@ -342,7 +368,7 @@
                 
                 try {
                   await localConnection.addIceCandidate(new RTCIceCandidate(candidate));
-                  console.log("✅ ICE Candidate added");
+                  console.log("✅ ICE Candidate added:", candidate.candidate.substring(0, 30) + "...");
                 } catch (err) {
                   // Bỏ qua InvalidStateError - nó không phải là lỗi thực sự
                   if (err.name !== 'InvalidStateError' && !err.message.includes('setRemoteDescription')) {
@@ -371,6 +397,21 @@
     }
 
     document.getElementById('receiveCallButton').addEventListener('click', receiveCall);
+
+    // Monitor video stream availability
+    setInterval(() => {
+      const remoteVideo = document.getElementById('remoteVideo');
+      if (remoteVideo && remoteVideo.srcObject) {
+        const videoTracks = remoteVideo.srcObject.getVideoTracks();
+        const audioTracks = remoteVideo.srcObject.getAudioTracks();
+        
+        if (videoTracks.length > 0 && videoTracks[0].enabled) {
+          if (!remoteVideo.srcObject.active) {
+            console.warn("⚠️ Remote stream is inactive!");
+          }
+        }
+      }
+    }, 5000);
     
     function checkStatus() {
       let status = `📊 Connection Status\n`;
