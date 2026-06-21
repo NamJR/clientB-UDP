@@ -104,19 +104,45 @@
       🔗 <span class="label">Connection ID:</span>
       <span id="connectionIdDisplay"></span>
     </div>
+    <div id="statusInfo" style="margin-top:12px;font-size:16px;color:#555;"></div>
   </div>
 
   <script>
-    // Mỗi lần load trang phải nhập lại IP và Port (không lưu localStorage)
-    let SERVER_IP = prompt("📡 Nhập IPv4 Address của Server (ví dụ: 192.168.1.14):", "192.168.1.14");
+    function isVirtualIp(ip) {
+      const p = ip.split('.').map(Number);
+      if (p.length !== 4 || p.some(n => Number.isNaN(n))) return true;
+      if (p[0] === 172 && p[1] >= 16 && p[1] <= 31) return true;
+      if (p[0] === 127 || p[0] === 26) return true;
+      return false;
+    }
+
+    function setStatus(text, isError = false) {
+      const el = document.getElementById('statusInfo');
+      if (el) {
+        el.textContent = text;
+        el.style.color = isError ? '#c0392b' : '#555';
+      }
+    }
+
+    // Mỗi lần load: chỉ nhập lại IPv4 (không lưu localStorage). Port mặc định 5221.
+    let SERVER_IP = prompt(
+      "📡 IP LAN máy chạy server (ipconfig → IPv4):\nvd: 192.168.1.14 — KHÔNG dùng 0.0.0.0 / 172.x.x.x",
+      "192.168.1.14"
+    );
     if (!SERVER_IP) {
       alert("❌ Cần nhập IPv4 Address!");
       throw new Error("IPv4 Address không được cấu hình");
     }
+    SERVER_IP = SERVER_IP.trim();
+    if (isVirtualIp(SERVER_IP) || SERVER_IP === '0.0.0.0') {
+      alert("❌ IP không hợp lệ. Dùng IP LAN thật (vd: 192.168.1.x)");
+      throw new Error("Invalid server IP");
+    }
 
-    let SERVER_PORT = prompt("Nhập Port Server (mặc định 5221):", "5221") || "5221";
+    const SERVER_PORT = "5221";
     const SERVER_URL = `http://${SERVER_IP}:${SERVER_PORT}/api/Signal`;
     console.log("🔗 Server URL:", SERVER_URL);
+    setStatus(`Server: ${SERVER_IP}:${SERVER_PORT}`);
     
     let localConnection;
     let connectionId = null;
@@ -126,18 +152,86 @@
     let processedCandidates = new Set();
     let answerSent = false;
     let pendingIceCandidates = [];
+    let remoteStreamAssigned = false;
 
     const LAN_PEER_CONFIG = {
       iceServers: [],
       iceCandidatePoolSize: 0,
       bundlePolicy: 'max-bundle',
-      rtcpMuxPolicy: 'require'
+      rtcpMuxPolicy: 'require',
+      iceTransportPolicy: 'all'
     };
 
     const MEDIA_CONSTRAINTS = {
       video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
       audio: { echoCancellation: true, noiseSuppression: true }
     };
+
+    function shouldSendLanCandidate(candidate) {
+      const line = candidate?.candidate || '';
+      if (!line) return false;
+      if (line.includes(' tcp ')) return false;
+      if (line.includes('::')) return false;
+      const match = line.match(/(\d+\.\d+\.\d+\.\d+)/);
+      if (!match) return true;
+      return !isVirtualIp(match[1]);
+    }
+
+    function attachRemoteVideo(stream) {
+      const remoteVideo = document.getElementById('remoteVideo');
+      remoteVideo.srcObject = stream;
+      const tryPlay = () => remoteVideo.play().catch(() => {});
+      stream.getVideoTracks().forEach(t => { t.onunmute = tryPlay; });
+      tryPlay();
+    }
+
+    function startIceCandidatePolling(peerRole) {
+      if (iceFetchInterval) clearInterval(iceFetchInterval);
+      let emptyPolls = 0;
+
+      iceFetchInterval = setInterval(async () => {
+        if (!connectionId || !localConnection) return;
+
+        const ice = localConnection.iceConnectionState;
+        if (ice === 'connected' || ice === 'completed') {
+          emptyPolls++;
+          if (emptyPolls >= 5) {
+            clearInterval(iceFetchInterval);
+            iceFetchInterval = null;
+            setStatus('✅ Đang nhận video từ Client A');
+          }
+          return;
+        }
+        if (ice === 'failed' || ice === 'closed') {
+          clearInterval(iceFetchInterval);
+          iceFetchInterval = null;
+          return;
+        }
+
+        try {
+          const response = await fetch(`${SERVER_URL}/candidate/${connectionId}?role=${peerRole}`);
+          if (!response.ok) return;
+          const candidates = await response.json();
+          if (!candidates?.length) return;
+
+          for (const c of candidates) {
+            if (!c?.candidate) continue;
+            const key = JSON.stringify(c);
+            if (processedCandidates.has(key)) continue;
+            processedCandidates.add(key);
+            try {
+              await localConnection.addIceCandidate(new RTCIceCandidate(c));
+            } catch (err) {
+              if (!err.message?.includes('setRemoteDescription')) {
+                console.warn('ICE add:', err.message);
+              }
+            }
+          }
+        } catch (err) {
+          console.error('ICE poll:', err);
+        }
+      }, 250);
+    }
 
     async function getLocalVideoStream() {
       try {
@@ -151,6 +245,7 @@
     }
 
     function queueOrSendIceCandidate(candidate) {
+      if (!shouldSendLanCandidate(candidate)) return;
       if (!connectionId || !answerSent) {
         pendingIceCandidates.push(candidate);
         return;
@@ -165,7 +260,7 @@
     }
 
     async function receiveCall() {
-      connectionId = prompt("📞 Nhập Connection ID để nhận cuộc gọi từ Client A:");
+      connectionId = (prompt("📞 Nhập Connection ID từ Client A (copy nguyên, không thêm khoảng trắng):") || "").trim();
       if (!connectionId) {
         console.log("❌ Connection ID không được cung cấp");
         return;
@@ -175,143 +270,94 @@
       document.getElementById('connectionInfo').style.display = "inline-block";
 
       connectionStatus = "connecting";
-      console.log("📥 Đang chờ nhận Offer từ Client A...");
-      console.log("🔗 Server URL:", SERVER_URL);
-      
-      // Retry logic - lấy Offer với nhiều lần thử
-      const maxRetries = 15;
+      setStatus("⏳ Đang lấy Offer từ server…");
+
+      const maxRetries = 120;
       let retries = 0;
-      
+
       while (retries < maxRetries) {
         try {
-          console.log(`⏳ Lần thử ${retries + 1}/${maxRetries}...`);
-          const response = await fetch(`${SERVER_URL}/offer/${connectionId}`, {
-            timeout: 5000
-          });
-          
-          if (!response.ok) {
-            if (response.status === 404) {
-              console.log("⏳ Offer chưa có. Client A chưa gửi offer...");
-            } else {
-              throw new Error(`HTTP Status: ${response.status}`);
-            }
+          const response = await fetch(`${SERVER_URL}/offer/${connectionId}`);
+
+          if (response.status === 404) {
+            setStatus("❌ Connection ID sai hoặc Client A chưa Start Call", true);
+            alert("❌ Connection ID không tồn tại trên server.\nKiểm tra Client A đã Start Call và ID copy đúng.");
+            return;
+          }
+          if (response.status === 204) {
+            // chờ Client A
+          } else if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
           } else {
             const offer = await response.json();
-            console.log("✅ Offer nhận được:", offer);
             await handleOffer(offer);
             return;
           }
         } catch (error) {
-          console.error(`🚨 Lần thử ${retries + 1} thất bại:`, error.message);
+          console.error(`Lần thử ${retries + 1}:`, error.message);
         }
-        
+
         retries++;
-        // Chờ 2 giây trước lần thử tiếp theo
-        await new Promise(resolve => setTimeout(resolve, 2000));
+        await new Promise(resolve => setTimeout(resolve, 500));
       }
       
       connectionStatus = "disconnected";
-      console.error("❌ Không lấy được Offer sau " + maxRetries + " lần thử");
-      alert("❌ Lỗi: Không thể nhận Offer từ Client A sau " + maxRetries + " lần thử. Kiểm tra:\n1. Client A đã nhấn Start Call chưa?\n2. Connection ID có đúng không?\n3. Server có chạy không?");
+      setStatus("❌ Không nhận được Offer — kiểm tra IP server và Connection ID", true);
+      alert("❌ Không lấy được Offer sau 60 giây.\n1. Client A đã Start Call?\n2. Cùng IP server?\n3. Connection ID đúng?");
     }
 
     async function handleOffer(offer) {
       try {
-        // Lấy local stream TRƯỚC khi tạo PeerConnection
-        console.log("🎤 Đang lấy local stream...");
-        localStream = await getLocalVideoStream();
+        answerSent = false;
+        remoteStreamAssigned = false;
+        processedCandidates.clear();
+        pendingIceCandidates = [];
 
+        setStatus("🎤 Đang mở camera…");
+        localStream = await getLocalVideoStream();
         localConnection = new RTCPeerConnection(LAN_PEER_CONFIG);
 
-        console.log("📊 PeerConnection được tạo");
-
-        // Thêm local tracks TRƯỚC khi set remote description
-        localStream.getTracks().forEach(track => {
-          console.log("🎯 Adding track:", track.kind);
-          localConnection.addTrack(track, localStream);
-        });
+        localStream.getTracks().forEach(track => localConnection.addTrack(track, localStream));
 
         localConnection.onicecandidate = event => {
-          if (event.candidate) {
-            console.log("🧊 Candidate từ Client B:", event.candidate.candidate.substring(0, 50) + "...");
-            queueOrSendIceCandidate(event.candidate);
-          } else {
-            console.log("✅ ICE gathering complete");
-          }
+          if (event.candidate) queueOrSendIceCandidate(event.candidate);
         };
 
         localConnection.oniceconnectionstatechange = () => {
-          console.log("🔌 ICE Connection State:", localConnection.iceConnectionState);
-          if (localConnection.iceConnectionState === "connected") {
-            connectionStatus = "connected";
-            console.log("✅ ICE Connection thành công!");
-          } else if (localConnection.iceConnectionState === "completed") {
-            connectionStatus = "connected";
-            console.log("✅ ICE Connection completed!");
-          } else if (localConnection.iceConnectionState === "failed") {
-            connectionStatus = "disconnected";
-            console.error("❌ ICE Connection thất bại! Kiểm tra firewall/NAT/TURN server");
-            // Thử reconnect
-            setTimeout(() => {
-              if (connectionStatus === "disconnected") {
-                console.log("🔄 Attempting reconnection...");
-                receiveCall();
-              }
-            }, 3000);
-          } else if (localConnection.iceConnectionState === "disconnected") {
-            connectionStatus = "disconnected";
-            console.error("❌ ICE Connection bị ngắt!");
+          const ice = localConnection.iceConnectionState;
+          if (ice === 'connected' || ice === 'completed') {
+            connectionStatus = 'connected';
+            setStatus('✅ ICE kết nối — nhận video từ Client A…');
+          } else if (ice === 'failed') {
+            connectionStatus = 'disconnected';
+            setStatus('❌ ICE thất bại — kiểm tra firewall UDP', true);
           }
-        };
-
-        localConnection.onconnectionstatechange = () => {
-          console.log("📡 Connection State:", localConnection.connectionState);
         };
 
         localConnection.ontrack = event => {
-          console.log("📹 Received track từ Client A:", event.track.kind);
-          const remoteVideo = document.getElementById('remoteVideo');
-          if (event.streams?.length > 0) {
-            remoteVideo.srcObject = event.streams[0];
-            remoteVideo.play().catch(err => console.warn("Play deferred:", err.message));
-            console.log("✅ Remote video stream set successfully");
-          }
+          if (!event.streams?.[0] || remoteStreamAssigned) return;
+          remoteStreamAssigned = true;
+          attachRemoteVideo(event.streams[0]);
         };
 
-        localConnection.addEventListener('track', (event) => {
-          if (event.track.kind === 'video') {
-            console.log("✅ Video track received!");
-          }
-        });
-
-        // Set remote description từ Offer
-        console.log("📋 Setting remote description...");
         await localConnection.setRemoteDescription(new RTCSessionDescription(offer));
-        console.log("✅ Remote Description đã được set");
 
-        // Tạo Answer
-        console.log("💬 Creating answer...");
         const answer = await localConnection.createAnswer();
         await localConnection.setLocalDescription(answer);
-        console.log("✅ Local Description (Answer) đã được set");
 
-        // Gửi Answer lên server
-        console.log("📤 Sending answer to server...");
+        setStatus("📤 Gửi Answer lên server…");
         const response = await fetch(`${SERVER_URL}/answer/${connectionId}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(answer),
         });
 
-        if (!response.ok) {
-          throw new Error(`Server rejected answer. Status: ${response.status}`);
-        }
+        if (!response.ok) throw new Error(`Server rejected answer (${response.status})`);
 
         answerSent = true;
-        console.log("✅ Answer gửi thành công!");
         flushPendingIceCandidates();
-
-        fetchIceCandidates();
+        setStatus("⏳ Hoàn tất signaling — thiết lập ICE…");
+        startIceCandidatePolling('offerer');
       } catch (error) {
         connectionStatus = "disconnected";
         console.error("🚨 Error handling offer:", error);
@@ -332,72 +378,12 @@
       }
     }
 
-    async function fetchIceCandidates() {
-      if (iceFetchInterval) clearInterval(iceFetchInterval);
-
-      processedCandidates.clear();
-      console.log("🔄 Bắt đầu lấy ICE Candidates từ Client A...");
-
-      iceFetchInterval = setInterval(async () => {
-        if (!connectionId || !localConnection) return;
-
-        if (localConnection.iceConnectionState === "completed" ||
-            localConnection.iceConnectionState === "connected") {
-          clearInterval(iceFetchInterval);
-          iceFetchInterval = null;
-          return;
-        }
-
-        try {
-          const response = await fetch(`${SERVER_URL}/candidate/${connectionId}?role=offerer`);
-          if (!response.ok) return;
-
-          const candidates = await response.json();
-          if (!candidates?.length) return;
-
-          console.log(`📦 Nhận ${candidates.length} ICE Candidates từ Client A`);
-
-          for (const candidate of candidates) {
-            if (!candidate?.candidate) continue;
-
-            const candidateStr = JSON.stringify(candidate);
-            if (processedCandidates.has(candidateStr)) continue;
-            processedCandidates.add(candidateStr);
-
-            try {
-              await localConnection.addIceCandidate(new RTCIceCandidate(candidate));
-            } catch (err) {
-              if (!err.message.includes('setRemoteDescription')) {
-                console.error("🚨 Error adding ICE Candidate:", err.message);
-              }
-            }
-          }
-        } catch (error) {
-          console.error("🚨 Error fetching ICE Candidates:", error.message);
-        }
-      }, 300);
-    }
-
     document.getElementById('receiveCallButton').addEventListener('click', receiveCall);
 
-    // Monitor video stream availability
-    setInterval(() => {
-      const remoteVideo = document.getElementById('remoteVideo');
-      if (remoteVideo && remoteVideo.srcObject) {
-        const videoTracks = remoteVideo.srcObject.getVideoTracks();
-        const audioTracks = remoteVideo.srcObject.getAudioTracks();
-        
-        if (videoTracks.length > 0 && videoTracks[0].enabled) {
-          if (!remoteVideo.srcObject.active) {
-            console.warn("⚠️ Remote stream is inactive!");
-          }
-        }
-      }
-    }, 5000);
-    
     function checkStatus() {
       let status = `📊 Connection Status\n`;
       status += `━━━━━━━━━━━━━━━━━━━━━\n`;
+      status += `🔗 Server: ${SERVER_IP}:${SERVER_PORT}\n`;
       status += `🔗 Connection ID: ${connectionId || 'Not set'}\n`;
       status += `📡 Status: ${connectionStatus}\n`;
       status += `\n🔌 PeerConnection States:\n`;
@@ -413,8 +399,7 @@
       
       status += `\n📹 Streams:\n`;
       status += `  • Local: ${localStream ? 'Active' : 'Not started'}\n`;
-      status += `  • Remote: ${(localConnection && localConnection.remoteDescription) ? 'Ready' : 'Waiting'}\n`;
-      
+      status += `  • Remote: ${remoteStreamAssigned ? 'Receiving' : 'Waiting'}\n`;
       status += `\n📤 Answer Sent: ${answerSent ? 'Yes' : 'No'}\n`;
       
       console.log(status);
