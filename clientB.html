@@ -93,6 +93,7 @@
     <div class="btn-group">
       <button id="receiveCallButton">Receive Call</button>
       <button id="checkStatusButton" style="background-color: #e74c3c;">🔍 Check Status</button>
+      <button id="videoPerfButton" style="background-color: #8e44ad;">📊 Video Stats</button>
     </div>
 
     <div class="video-container">
@@ -134,10 +135,10 @@
       throw new Error("IPv4 Address không được cấu hình");
     }
     SERVER_IP = SERVER_IP.trim();
-    if (isVirtualIp(SERVER_IP) || SERVER_IP === '0.0.0.0') {
-      alert("❌ IP không hợp lệ. Dùng IP LAN thật (vd: 192.168.1.x)");
-      throw new Error("Invalid server IP");
-    }
+    // if (isVirtualIp(SERVER_IP) || SERVER_IP === '0.0.0.0') {
+    //   alert("❌ IP không hợp lệ. Dùng IP LAN thật (vd: 192.168.1.x)");
+    //   throw new Error("Invalid server IP");
+    // }
 
     const SERVER_PORT = "5221";
     const SERVER_URL = `http://${SERVER_IP}:${SERVER_PORT}/api/Signal`;
@@ -153,6 +154,8 @@
     let answerSent = false;
     let pendingIceCandidates = [];
     let remoteStreamAssigned = false;
+    let videoPerfMonitorId = null;
+    let videoPerfPrev = null;
 
     const LAN_PEER_CONFIG = {
       iceServers: [],
@@ -231,6 +234,120 @@
           console.error('ICE poll:', err);
         }
       }, 250);
+    }
+
+    async function collectVideoPerformanceMetrics(pc) {
+      if (!pc) return null;
+
+      const stats = await pc.getStats();
+      let candidatePair = null;
+      const inboundVideo = [];
+      const outboundVideo = [];
+      const remoteInboundVideo = [];
+
+      stats.forEach(report => {
+        if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+          if (!candidatePair || report.nominated) candidatePair = report;
+        }
+        if (report.type === 'inbound-rtp' && report.kind === 'video') inboundVideo.push(report);
+        if (report.type === 'outbound-rtp' && report.kind === 'video') outboundVideo.push(report);
+        if (report.type === 'remote-inbound-rtp' && report.kind === 'video') remoteInboundVideo.push(report);
+      });
+
+      const rttSec = candidatePair?.currentRoundTripTime ?? candidatePair?.roundTripTime;
+      const metrics = {
+        timestamp: new Date().toLocaleTimeString(),
+        rttMs: rttSec != null ? Math.round(rttSec * 1000) : null,
+        inbound: null,
+        outbound: null,
+        intervalLossPercent: null
+      };
+
+      if (inboundVideo.length) {
+        const r = inboundVideo[0];
+        const received = r.packetsReceived ?? 0;
+        const lost = r.packetsLost ?? 0;
+        const total = received + lost;
+        let delayMs = null;
+        if (r.jitterBufferDelay != null && r.jitterBufferEmittedCount > 0) {
+          delayMs = Math.round((r.jitterBufferDelay / r.jitterBufferEmittedCount) * 1000);
+        } else if (r.googCurrentDelayMs != null) {
+          delayMs = Math.round(r.googCurrentDelayMs);
+        }
+        metrics.inbound = {
+          packetsReceived: received,
+          packetsLost: lost,
+          lossPercent: total > 0 ? ((lost / total) * 100).toFixed(2) : '0.00',
+          estimatedDelayMs: delayMs,
+          jitterMs: r.jitter != null ? Math.round(r.jitter * 1000) : null,
+          framesDecoded: r.framesDecoded ?? null,
+          framesDropped: r.framesDropped ?? null,
+          fps: r.framesPerSecond ?? null
+        };
+      }
+
+      if (outboundVideo.length) {
+        const r = outboundVideo[0];
+        metrics.outbound = {
+          packetsSent: r.packetsSent ?? null,
+          fps: r.framesPerSecond ?? null
+        };
+      }
+
+      if (videoPerfPrev?.inbound && metrics.inbound) {
+        const dLost = metrics.inbound.packetsLost - videoPerfPrev.inbound.packetsLost;
+        const dRecv = metrics.inbound.packetsReceived - videoPerfPrev.inbound.packetsReceived;
+        const dTotal = dLost + dRecv;
+        metrics.intervalLossPercent = dTotal > 0 ? ((dLost / dTotal) * 100).toFixed(2) : '0.00';
+      }
+
+      videoPerfPrev = metrics.inbound ? { inbound: { ...metrics.inbound } } : null;
+      return metrics;
+    }
+
+    function printVideoPerformanceStats(roleLabel = 'Client B') {
+      if (!localConnection) {
+        console.warn('⚠️ Chưa có PeerConnection — Receive Call trước.');
+        return;
+      }
+      collectVideoPerformanceMetrics(localConnection).then(m => {
+        if (!m) return;
+        console.log(`\n=== 📊 HIỆU NĂNG VIDEO (${roleLabel}) — ${m.timestamp} ===`);
+        console.log(`RTT (ICE): ${m.rttMs != null ? m.rttMs + ' ms' : 'N/A'}`);
+
+        if (m.inbound) {
+          console.log('--- Video NHẬN từ Client A ---');
+          console.log(`  Độ trễ ước tính (jitter buffer): ${m.inbound.estimatedDelayMs ?? 'N/A'} ms`);
+          console.log(`  Jitter: ${m.inbound.jitterMs ?? 'N/A'} ms`);
+          console.log(`  Gói nhận: ${m.inbound.packetsReceived} | Gói mất: ${m.inbound.packetsLost}`);
+          console.log(`  Tỉ lệ mất gói (tích lũy): ${m.inbound.lossPercent}%`);
+          if (m.intervalLossPercent != null) {
+            console.log(`  Tỉ lệ mất gói (khoảng vừa qua): ${m.intervalLossPercent}%`);
+          }
+          console.log(`  FPS decode: ${m.inbound.fps ?? 'N/A'} | Frames dropped: ${m.inbound.framesDropped ?? 0}`);
+        } else {
+          console.log('  (Chưa có dữ liệu inbound video — chờ ICE connected)');
+        }
+
+        console.log('========================================\n');
+      }).catch(err => console.error('Stats error:', err));
+    }
+
+    function startVideoPerformanceMonitor(intervalSec = 2) {
+      stopVideoPerformanceMonitor();
+      videoPerfPrev = null;
+      console.log(`▶️ Monitor hiệu năng mỗi ${intervalSec}s`);
+      printVideoPerformanceStats('Client B');
+      videoPerfMonitorId = setInterval(() => printVideoPerformanceStats('Client B'), intervalSec * 1000);
+    }
+
+    function stopVideoPerformanceMonitor() {
+      if (videoPerfMonitorId) {
+        clearInterval(videoPerfMonitorId);
+        videoPerfMonitorId = null;
+        videoPerfPrev = null;
+        console.log('⏹️ Đã dừng monitor hiệu năng video');
+      }
     }
 
     async function getLocalVideoStream() {
@@ -407,6 +524,10 @@
     }
     
     document.getElementById('checkStatusButton').addEventListener('click', checkStatus);
+    document.getElementById('videoPerfButton').addEventListener('click', () => {
+      if (videoPerfMonitorId) stopVideoPerformanceMonitor();
+      else startVideoPerformanceMonitor(2);
+    });
   </script>
 </body>
 </html>
